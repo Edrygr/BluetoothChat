@@ -321,10 +321,17 @@ class BluetoothService {
     if (centralDev) {
       const b64 = utf8ToBase64(frame);
       try {
-        await centralDev.writeCharacteristicWithResponseForService(SERVICE_UUID, TX_UUID, b64);
+        // Write-without-response avoids blocking the ATT layer, which prevents
+        // a deadlock when the peer is simultaneously sending us a notification.
+        await centralDev.writeCharacteristicWithoutResponseForService(SERVICE_UUID, TX_UUID, b64);
       } catch {
-        this.centralConns.delete(deviceId);
-        this.dropPeer(deviceId);
+        // Only drop if the BLE connection is actually gone; transient ATT
+        // errors should not destroy the session state.
+        const alive = await centralDev.isConnected().catch(() => false);
+        if (!alive) {
+          this.centralConns.delete(deviceId);
+          this.dropPeer(deviceId);
+        }
       }
       return;
     }
@@ -334,8 +341,9 @@ class BluetoothService {
       try {
         await BlePeripheral?.send(deviceId, frame);
       } catch {
-        this.peripheralConns.delete(deviceId);
-        this.dropPeer(deviceId);
+        // Notification can fail transiently (ATT busy) when both sides write at
+        // the same moment. Swallow the error; the BlePeripheralCentralDisconnected
+        // event will clean up if the peer truly disconnected.
       }
     }
   }
