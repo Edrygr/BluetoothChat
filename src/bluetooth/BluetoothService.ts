@@ -74,6 +74,10 @@ const COVER_INTERVAL_MAX_MS  = 14_000;
 const SEEN_TTL_MS            = 60_000;
 const MTU                    = 512;
 const FRAME_PAYLOAD          = 490; // chars of JSON per BLE frame
+const MESH_TTL               = 5;   // max relay hops
+
+// Prefix for virtual (multi-hop) peer keys in the peers / ratchets maps
+const VIRT = 'virtual:';
 
 // ─── BLE framing ─────────────────────────────────────────────────────────────
 
@@ -122,6 +126,11 @@ class BluetoothService {
   private recvRatchets  = new Map<string, RatchetState>();
   private seenIds       = new Map<string, number>();
   private pendingMedia  = new Map<string, Map<string, string[]>>();
+
+  // Mesh routing: for virtual peers (multi-hop), maps peerKey → BLE deviceId of next hop
+  private virtualRoutes  = new Map<string, string>();
+  // O(1) anonymousId → peerKey lookup (direct: peerKey=deviceId, virtual: peerKey='virtual:'+anon)
+  private anonToPeerKey  = new Map<string, string>();
 
   // Per-device reassembly buffer: deviceId → Map<seqId, ReassemblyBuf>
   private reassembly = new Map<string, Map<number, ReassemblyBuf>>();
@@ -211,7 +220,7 @@ class BluetoothService {
       }),
       emitter.addListener('BlePeripheralCentralDisconnected', (address: string) => {
         this.peripheralConns.delete(address);
-        this.dropPeer(address);
+        this.dropPeersByLink(address);
       }),
       emitter.addListener('BlePeripheralDataReceived', (evt: { address: string; data: string }) => {
         this.handleRawFrame(evt.data, evt.address);
@@ -270,7 +279,7 @@ class BluetoothService {
 
       connected.onDisconnected(() => {
         this.centralConns.delete(device.id);
-        this.dropPeer(device.id);
+        this.dropPeersByLink(device.id);
       });
 
       this.sendHandshake(device.id);
@@ -334,7 +343,7 @@ class BluetoothService {
       }
       // All retries failed — drop peer so devices reconnect and reset ratchet.
       this.centralConns.delete(deviceId);
-      this.dropPeer(deviceId);
+      this.dropPeersByLink(deviceId);
       return;
     }
 
@@ -351,7 +360,7 @@ class BluetoothService {
       }
       // All retries failed — drop peer so the ratchet resets on reconnect.
       this.peripheralConns.delete(deviceId);
-      this.dropPeer(deviceId);
+      this.dropPeersByLink(deviceId);
     }
   }
 
@@ -378,7 +387,7 @@ class BluetoothService {
       case 'MEDIA_CHUNK': this.handleMediaChunk(pkt, fromDeviceId);  break;
       case 'MEDIA_END':   this.handleMediaEnd(pkt, fromDeviceId);    break;
       case 'COVER':       /* intentionally ignored */                 break;
-      case 'DISCONNECT':  this.dropPeer(fromDeviceId);               break;
+      case 'DISCONNECT':  this.dropPeersByLink(fromDeviceId);        break;
     }
   }
 
@@ -387,42 +396,126 @@ class BluetoothService {
   private handleHandshake(pkt: BTPacket, fromDeviceId: string): void {
     if (!pkt.publicKey || !pkt.anonymousId || !this.keyPair) return;
 
-    const isNewPeer    = !this.peers.has(fromDeviceId);
+    // Directed HANDSHAKE (to: field set) not meant for us — relay toward target.
+    if (pkt.to && pkt.to !== this.anonymousId) {
+      this.relayToward(pkt, pkt.to, fromDeviceId);
+      return;
+    }
+
+    // Don't process our own HANDSHAKE that looped back.
+    if (pkt.anonymousId === this.anonymousId) return;
+
+    // Determine the peer key: direct BLE link or virtual multi-hop peer.
+    const isDirectBle = this.centralConns.has(fromDeviceId) || this.peripheralConns.has(fromDeviceId);
+    const peerKey     = isDirectBle ? fromDeviceId : `${VIRT}${pkt.anonymousId}`;
+    const isNewPeer   = !this.peers.has(peerKey);
+
     const theirPub     = fromHex(pkt.publicKey);
     const sharedSecret = deriveSharedSecret(this.keyPair.privateKey, theirPub);
     const sas          = deriveSAS(sharedSecret);
 
-    this.sendRatchets.set(fromDeviceId, initRatchet(sharedSecret));
-    this.recvRatchets.set(fromDeviceId, initRatchet(sharedSecret));
+    this.sendRatchets.set(peerKey, initRatchet(sharedSecret));
+    this.recvRatchets.set(peerKey, initRatchet(sharedSecret));
+    this.anonToPeerKey.set(pkt.anonymousId, peerKey);
 
-    this.peers.set(fromDeviceId, {
-      deviceId:    fromDeviceId,
-      anonymousId: pkt.anonymousId,
+    this.peers.set(peerKey, {
+      deviceId:     peerKey,
+      anonymousId:  pkt.anonymousId,
       publicKeyHex: pkt.publicKey,
       sas,
       connected: true,
     });
+
+    if (!isDirectBle) {
+      // Record which BLE link to use when routing to this virtual peer.
+      this.virtualRoutes.set(peerKey, fromDeviceId);
+    }
+
     this.notifyPeers();
 
-    // When we are the PERIPHERAL for this device, the proactive handshake
-    // we sent in BlePeripheralCentralConnected fired before they subscribed
-    // to RX notifications and was silently dropped. Now that they have
-    // subscribed and sent us their handshake via TX write, reply with ours
-    // so they can complete key exchange on their end.
-    if (isNewPeer && this.peripheralConns.has(fromDeviceId)) {
+    // Peripheral reply: our proactive sendHandshake fired before they subscribed;
+    // now that their TX write proves they're ready, send ours.
+    if (isNewPeer && isDirectBle && this.peripheralConns.has(fromDeviceId)) {
       this.sendHandshake(fromDeviceId);
+    }
+
+    // For virtual peers, send a directed HANDSHAKE so they can complete the
+    // key exchange on their side.
+    if (isNewPeer && !isDirectBle) {
+      this.sendHandshakeDirected(pkt.anonymousId, fromDeviceId);
+    }
+
+    // Relay broadcast HANDSHAKE (no `to` field) to other direct BLE peers
+    // so they can discover and key-exchange with multi-hop neighbours.
+    if (isNewPeer && !pkt.to && (pkt.ttl ?? MESH_TTL) > 0) {
+      this.relayHandshake(pkt, fromDeviceId);
     }
   }
 
   private sendHandshake(deviceId: string): void {
     if (!this.keyPair) return;
     this.writeToDevice(deviceId, {
-      type:        'HANDSHAKE',
-      id:          generateMessageId(),
-      from:        this.anonymousId,
-      publicKey:   toHex(this.keyPair.publicKey),
+      type: 'HANDSHAKE', id: generateMessageId(),
+      from: this.anonymousId, ttl: MESH_TTL,
+      publicKey: toHex(this.keyPair.publicKey),
       anonymousId: this.anonymousId,
     });
+  }
+
+  private sendHandshakeDirected(targetAnonymousId: string, viaDeviceId: string): void {
+    if (!this.keyPair) return;
+    this.writeToDevice(viaDeviceId, {
+      type: 'HANDSHAKE', id: generateMessageId(),
+      from: this.anonymousId, to: targetAnonymousId, ttl: MESH_TTL,
+      publicKey: toHex(this.keyPair.publicKey),
+      anonymousId: this.anonymousId,
+    });
+  }
+
+  private relayHandshake(pkt: BTPacket, receivedFrom: string): void {
+    const fwd = { ...pkt, ttl: (pkt.ttl ?? MESH_TTL) - 1 };
+    // Forward to all direct BLE links except the one it came from.
+    const sent = new Set<string>();
+    for (const deviceId of [
+      ...this.centralConns.keys(),
+      ...this.peripheralConns.keys(),
+    ]) {
+      if (deviceId !== receivedFrom && !sent.has(deviceId)) {
+        sent.add(deviceId);
+        this.writeToDevice(deviceId, fwd);
+      }
+    }
+  }
+
+  // Route a directed packet toward a peer identified by anonymousId.
+  // Uses virtualRoutes if known, otherwise floods to all direct BLE links.
+  private relayToward(pkt: BTPacket, targetAnonymousId: string, receivedFrom: string): void {
+    if ((pkt.ttl ?? 0) <= 0) return;
+    const fwd = { ...pkt, ttl: (pkt.ttl ?? 1) - 1 };
+
+    const peerKey = this.anonToPeerKey.get(targetAnonymousId);
+    const nextHop = peerKey ? (this.virtualRoutes.get(peerKey) ?? peerKey) : null;
+
+    if (nextHop && nextHop !== receivedFrom) {
+      this.writeToDevice(nextHop, fwd);
+    } else {
+      // Route unknown — flood to all direct peers except sender.
+      const sent = new Set<string>();
+      for (const deviceId of [
+        ...this.centralConns.keys(),
+        ...this.peripheralConns.keys(),
+      ]) {
+        if (deviceId !== receivedFrom && !sent.has(deviceId)) {
+          sent.add(deviceId);
+          this.writeToDevice(deviceId, fwd);
+        }
+      }
+    }
+  }
+
+  // Returns the actual BLE link deviceId to use when sending to a peerKey.
+  private linkFor(peerKey: string): string {
+    return this.virtualRoutes.get(peerKey) ?? peerKey;
   }
 
   // ─── Ratchet helpers ─────────────────────────────────────────────────────
@@ -465,10 +558,13 @@ class BluetoothService {
     if (this.seenIds.has(pkt.id)) return;
     this.seenIds.set(pkt.id, Date.now());
 
-    const peer = this.peers.get(fromDeviceId);
+    // Find the peer key for the original sender (pkt.from = anonymousId).
+    const peerKey = this.anonToPeerKey.get(pkt.from);
+    if (!peerKey) return;
+    const peer = this.peers.get(peerKey);
     if (!peer) return;
 
-    const plain = this.ratchetDecryptFrom(fromDeviceId, pkt, pkt.seqNum);
+    const plain = this.ratchetDecryptFrom(peerKey, pkt, pkt.seqNum);
     if (plain === null) return;
 
     this.onMessage?.({ ...pkt, data: plain, from: peer.anonymousId }, fromDeviceId);
@@ -476,13 +572,14 @@ class BluetoothService {
   }
 
   private relayGeneral(original: BTPacket, receivedFrom: string, plain: string): void {
-    for (const [deviceId] of this.peers) {
-      if (deviceId === receivedFrom) continue;
-      const enc = this.ratchetEncryptFor(deviceId, plain);
+    for (const [peerKey] of this.peers) {
+      const link = this.linkFor(peerKey);
+      if (link === receivedFrom) continue; // don't send back the way it came
+      const enc = this.ratchetEncryptFor(peerKey, plain);
       if (!enc) continue;
-      this.writeToDevice(deviceId, {
+      this.writeToDevice(link, {
         ...original,
-        from:   '',
+        from:   original.from,
         data:   enc.data,
         nonce:  enc.nonce,
         seqNum: enc.seqNum,
@@ -498,26 +595,29 @@ class BluetoothService {
     const isForMe = pkt.to === this.anonymousId;
     const isRelay = !isForMe && !!pkt.to;
 
+    const senderKey = this.anonToPeerKey.get(pkt.from);
+
     if (isForMe) {
-      const peer = this.peers.get(fromDeviceId);
+      if (!senderKey) return;
+      const peer = this.peers.get(senderKey);
       if (!peer) return;
-      const plain = this.ratchetDecryptFrom(fromDeviceId, pkt, pkt.seqNum);
+      const plain = this.ratchetDecryptFrom(senderKey, pkt, pkt.seqNum);
       if (plain === null) return;
       this.onMessage?.({ ...pkt, data: plain, from: peer.anonymousId }, fromDeviceId);
     } else if (isRelay) {
-      const srcPeer = this.peers.get(fromDeviceId);
-      if (!srcPeer) return;
-      const plain = this.ratchetDecryptFrom(fromDeviceId, pkt, pkt.seqNum);
+      if (!senderKey) return;
+      const plain = this.ratchetDecryptFrom(senderKey, pkt, pkt.seqNum);
       if (plain === null) return;
 
-      const target = this.getPeerByAnonymousId(pkt.to!);
-      if (!target) return;
-      const [targetId] = target;
-      const enc = this.ratchetEncryptFor(targetId, plain);
+      const targetKey = this.anonToPeerKey.get(pkt.to!);
+      if (!targetKey) return;
+      const enc = this.ratchetEncryptFor(targetKey, plain);
       if (!enc) return;
-      this.writeToDevice(targetId, {
+      const link = this.linkFor(targetKey);
+      if (link === fromDeviceId) return; // would loop back
+      this.writeToDevice(link, {
         ...pkt,
-        from:   '',
+        from:   pkt.from,
         data:   enc.data,
         nonce:  enc.nonce,
         seqNum: enc.seqNum,
@@ -529,28 +629,30 @@ class BluetoothService {
 
   private handleMediaStart(pkt: BTPacket, fromDeviceId: string): void {
     if (!pkt.mediaId || !pkt.totalChunks) return;
-    if (!this.pendingMedia.has(fromDeviceId)) this.pendingMedia.set(fromDeviceId, new Map());
-    this.pendingMedia.get(fromDeviceId)!.set(pkt.mediaId, []);
+    const key = pkt.from; // index by sender's anonymousId
+    if (!this.pendingMedia.has(key)) this.pendingMedia.set(key, new Map());
+    this.pendingMedia.get(key)!.set(pkt.mediaId, []);
   }
 
   private handleMediaChunk(pkt: BTPacket, fromDeviceId: string): void {
     if (!pkt.mediaId || pkt.chunkIndex === undefined || !pkt.data || !pkt.nonce || pkt.seqNum === undefined) return;
-    const chunks = this.pendingMedia.get(fromDeviceId)?.get(pkt.mediaId);
+    const senderKey = this.anonToPeerKey.get(pkt.from);
+    if (!senderKey) return;
+    const chunks = this.pendingMedia.get(pkt.from)?.get(pkt.mediaId);
     if (!chunks) return;
-    const plain = this.ratchetDecryptFrom(fromDeviceId, pkt, pkt.seqNum);
+    const plain = this.ratchetDecryptFrom(senderKey, pkt, pkt.seqNum);
     if (plain !== null) chunks[pkt.chunkIndex] = plain;
   }
 
   private handleMediaEnd(pkt: BTPacket, fromDeviceId: string): void {
     if (!pkt.mediaId) return;
-    const devMap = this.pendingMedia.get(fromDeviceId);
+    const devMap = this.pendingMedia.get(pkt.from);
     const chunks = devMap?.get(pkt.mediaId);
     if (!chunks) return;
     devMap?.delete(pkt.mediaId);
 
-    const peer = this.peers.get(fromDeviceId);
     this.onMessage?.(
-      { ...pkt, id: pkt.id ?? pkt.mediaId, from: peer?.anonymousId ?? pkt.from, data: chunks.filter(Boolean).join('') },
+      { ...pkt, id: pkt.id ?? pkt.mediaId, from: pkt.from, data: chunks.filter(Boolean).join('') },
       fromDeviceId,
     );
   }
@@ -560,32 +662,31 @@ class BluetoothService {
   sendGeneral(plain: string): void {
     const id = generateMessageId();
     this.seenIds.set(id, Date.now());
-    for (const [deviceId] of this.peers) {
-      const enc = this.ratchetEncryptFor(deviceId, plain);
+    for (const [peerKey] of this.peers) {
+      const enc = this.ratchetEncryptFor(peerKey, plain);
       if (!enc) continue;
-      this.writeToDevice(deviceId, {
-        type: 'GENERAL', id, from: this.anonymousId,
+      this.writeToDevice(this.linkFor(peerKey), {
+        type: 'GENERAL', id, from: this.anonymousId, ttl: MESH_TTL,
         data: enc.data, nonce: enc.nonce, seqNum: enc.seqNum,
       });
     }
   }
 
   sendDM(targetAnonymousId: string, plain: string): void {
-    const entry = this.getPeerByAnonymousId(targetAnonymousId);
-    if (!entry) return;
-    const [deviceId] = entry;
-    const enc = this.ratchetEncryptFor(deviceId, plain);
+    const peerKey = this.anonToPeerKey.get(targetAnonymousId);
+    if (!peerKey) return;
+    const enc = this.ratchetEncryptFor(peerKey, plain);
     if (!enc) return;
-    this.writeToDevice(deviceId, {
-      type: 'DM', id: generateMessageId(),
+    this.writeToDevice(this.linkFor(peerKey), {
+      type: 'DM', id: generateMessageId(), ttl: MESH_TTL,
       from: this.anonymousId, to: targetAnonymousId,
       data: enc.data, nonce: enc.nonce, seqNum: enc.seqNum,
     });
   }
 
   async sendMediaGeneral(base64: string, mediaKind: MediaKind, mimeType: string): Promise<void> {
-    for (const [deviceId] of this.peers) {
-      await this.sendMediaToPeer(deviceId, base64, mediaKind, mimeType, undefined);
+    for (const [peerKey] of this.peers) {
+      await this.sendMediaToPeer(peerKey, base64, mediaKind, mimeType, undefined);
     }
   }
 
@@ -593,48 +694,46 @@ class BluetoothService {
     targetAnonymousId: string, base64: string,
     mediaKind: MediaKind, mimeType: string,
   ): Promise<void> {
-    const entry = this.getPeerByAnonymousId(targetAnonymousId);
-    if (!entry) return;
-    await this.sendMediaToPeer(entry[0], base64, mediaKind, mimeType, targetAnonymousId);
+    const peerKey = this.anonToPeerKey.get(targetAnonymousId);
+    if (!peerKey) return;
+    await this.sendMediaToPeer(peerKey, base64, mediaKind, mimeType, targetAnonymousId);
   }
 
   private async sendMediaToPeer(
-    deviceId: string, base64: string,
+    peerKey: string, base64: string,
     mediaKind: MediaKind, mimeType: string, to: string | undefined,
   ): Promise<void> {
+    const link      = this.linkFor(peerKey);
     const mediaId   = generateMessageId();
     const messageId = generateMessageId();
     const chunks    = splitBase64IntoChunks(base64);
 
-    this.writeToDevice(deviceId, {
+    this.writeToDevice(link, {
       type: 'MEDIA_START', id: messageId, from: this.anonymousId,
       to, mediaId, mediaKind, mimeType, totalChunks: chunks.length,
     });
-    await this.drainQueue(deviceId);
+    await this.drainQueue(link);
 
     for (let i = 0; i < chunks.length; i++) {
-      // Abort early if peer disconnected mid-transfer
-      if (!this.peers.has(deviceId)) return;
+      if (!this.peers.has(peerKey)) return;
 
-      const enc = this.ratchetEncryptFor(deviceId, chunks[i]);
+      const enc = this.ratchetEncryptFor(peerKey, chunks[i]);
       if (!enc) continue;
-      this.writeToDevice(deviceId, {
+      this.writeToDevice(link, {
         type: 'MEDIA_CHUNK', id: generateMessageId(), from: this.anonymousId,
         to, mediaId, chunkIndex: i, totalChunks: chunks.length,
         data: enc.data, nonce: enc.nonce, seqNum: enc.seqNum,
       });
-      // Wait for this chunk's BLE write to complete before queueing the next
-      await this.drainQueue(deviceId);
-      // Brief pause for receiver-side processing
+      await this.drainQueue(link);
       await sleep(30);
     }
 
-    if (this.peers.has(deviceId)) {
-      this.writeToDevice(deviceId, {
+    if (this.peers.has(peerKey)) {
+      this.writeToDevice(link, {
         type: 'MEDIA_END', id: messageId, from: this.anonymousId,
         to, mediaId, mediaKind, mimeType,
       });
-      await this.drainQueue(deviceId);
+      await this.drainQueue(link);
     }
   }
 
@@ -654,11 +753,13 @@ class BluetoothService {
 
   private sendCover(): void {
     if (this.peers.size === 0) return;
-    const ids      = Array.from(this.peers.keys());
-    const deviceId = ids[Math.floor(Math.random() * ids.length)];
-    const enc      = this.ratchetEncryptFor(deviceId, '\x00');
+    // Only send cover traffic to direct BLE peers (not virtual — pointless over relay).
+    const directKeys = Array.from(this.peers.keys()).filter(k => !k.startsWith(VIRT));
+    if (directKeys.length === 0) return;
+    const peerKey = directKeys[Math.floor(Math.random() * directKeys.length)];
+    const enc     = this.ratchetEncryptFor(peerKey, '\x00');
     if (!enc) return;
-    this.writeToDevice(deviceId, {
+    this.writeToDevice(peerKey, {
       type: 'COVER', id: generateMessageId(), from: '',
       data: enc.data, nonce: enc.nonce, seqNum: enc.seqNum,
     });
@@ -666,23 +767,37 @@ class BluetoothService {
 
   // ─── Peer management ─────────────────────────────────────────────────────
 
-  private dropPeer(deviceId: string): void {
-    if (!this.peers.has(deviceId)) return;
-    this.peers.delete(deviceId);
-    this.sendRatchets.get(deviceId)?.chainKey.fill(0);
-    this.recvRatchets.get(deviceId)?.chainKey.fill(0);
-    this.sendRatchets.delete(deviceId);
-    this.recvRatchets.delete(deviceId);
-    this.reassembly.delete(deviceId);
-    this.writeQueues.delete(deviceId);
+  // Drop a peer by peerKey (deviceId for direct, 'virtual:anon' for multi-hop).
+  private dropPeer(peerKey: string): void {
+    const peer = this.peers.get(peerKey);
+    if (!peer) return;
+    this.anonToPeerKey.delete(peer.anonymousId);
+    this.virtualRoutes.delete(peerKey);
+    this.peers.delete(peerKey);
+    this.sendRatchets.get(peerKey)?.chainKey.fill(0);
+    this.recvRatchets.get(peerKey)?.chainKey.fill(0);
+    this.sendRatchets.delete(peerKey);
+    this.recvRatchets.delete(peerKey);
+    this.reassembly.delete(peerKey);
+    this.writeQueues.delete(peerKey);
     this.notifyPeers();
   }
 
-  private getPeerByAnonymousId(anonymousId: string): [string, Peer] | null {
-    for (const [id, peer] of this.peers) {
-      if (peer.anonymousId === anonymousId) return [id, peer];
+  // Drop all peers (direct and virtual) that route through a given BLE link.
+  private dropPeersByLink(deviceId: string): void {
+    // Direct peer
+    this.dropPeer(deviceId);
+    // Virtual peers routed via this link
+    for (const [peerKey, link] of this.virtualRoutes) {
+      if (link === deviceId) this.dropPeer(peerKey);
     }
-    return null;
+  }
+
+  private getPeerByAnonymousId(anonymousId: string): [string, Peer] | null {
+    const key = this.anonToPeerKey.get(anonymousId);
+    if (!key) return null;
+    const peer = this.peers.get(key);
+    return peer ? [key, peer] : null;
   }
 
   private notifyPeers(): void {
@@ -728,6 +843,8 @@ class BluetoothService {
     this.writeQueues.clear();
     this.pendingMedia.clear();
     this.seenIds.clear();
+    this.virtualRoutes.clear();
+    this.anonToPeerKey.clear();
     this.keyPair = null;
     this.anonymousId = '';
   }

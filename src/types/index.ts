@@ -13,8 +13,9 @@ export type MediaKind = 'image' | 'video';
 export interface BTPacket {
   type: MessageType;
   id: string;
-  from: string;          // anonymousId — omitted from relayed packets (minimal metadata)
-  to?: string;           // recipient anonymousId (DM only)
+  from: string;          // anonymousId of original sender (preserved across relay hops)
+  to?: string;           // recipient anonymousId (DM and directed HANDSHAKE)
+  ttl?: number;          // hops remaining — relay decrements and drops at 0
   data?: string;         // AES-GCM ciphertext (base64)
   nonce?: string;        // AES-GCM nonce (base64)
   seqNum?: number;       // ratchet sequence number (replay prevention)
