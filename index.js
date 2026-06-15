@@ -1,6 +1,9 @@
 /**
  * @format
+ * react-native-get-random-values MUST be the very first import
+ * so crypto.getRandomValues is polyfilled before @noble/ciphers loads.
  */
+import 'react-native-get-random-values';
 
 import { AppRegistry } from 'react-native';
 import App from './App';
