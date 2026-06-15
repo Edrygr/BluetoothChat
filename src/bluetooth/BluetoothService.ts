@@ -372,6 +372,7 @@ class BluetoothService {
   private handleHandshake(pkt: BTPacket, fromDeviceId: string): void {
     if (!pkt.publicKey || !pkt.anonymousId || !this.keyPair) return;
 
+    const isNewPeer    = !this.peers.has(fromDeviceId);
     const theirPub     = fromHex(pkt.publicKey);
     const sharedSecret = deriveSharedSecret(this.keyPair.privateKey, theirPub);
     const sas          = deriveSAS(sharedSecret);
@@ -387,6 +388,15 @@ class BluetoothService {
       connected: true,
     });
     this.notifyPeers();
+
+    // When we are the PERIPHERAL for this device, the proactive handshake
+    // we sent in BlePeripheralCentralConnected fired before they subscribed
+    // to RX notifications and was silently dropped. Now that they have
+    // subscribed and sent us their handshake via TX write, reply with ours
+    // so they can complete key exchange on their end.
+    if (isNewPeer && this.peripheralConns.has(fromDeviceId)) {
+      this.sendHandshake(fromDeviceId);
+    }
   }
 
   private sendHandshake(deviceId: string): void {
