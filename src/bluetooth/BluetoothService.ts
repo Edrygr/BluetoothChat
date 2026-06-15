@@ -320,30 +320,38 @@ class BluetoothService {
     const centralDev = this.centralConns.get(deviceId);
     if (centralDev) {
       const b64 = utf8ToBase64(frame);
-      try {
-        await centralDev.writeCharacteristicWithResponseForService(SERVICE_UUID, TX_UUID, b64);
-      } catch {
-        // Use BleManager.isDeviceConnected (not Device.isConnected which doesn't
-        // exist). Only drop peer if the device is truly gone; transient ATT errors
-        // (e.g. simultaneous writes) must not destroy the session state.
-        const alive = await this.ble.isDeviceConnected(deviceId).catch(() => false);
-        if (!alive) {
-          this.centralConns.delete(deviceId);
-          this.dropPeer(deviceId);
+      // Retry up to 3 times — Android GATT_ERROR 133 is common and transient.
+      // We MUST retry (not just swallow) because the send-ratchet has already
+      // advanced; if delivery is silently skipped the receiver's ratchet falls
+      // out of sync and every subsequent message becomes undeliverable.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await centralDev.writeCharacteristicWithResponseForService(SERVICE_UUID, TX_UUID, b64);
+          return; // success
+        } catch {
+          if (attempt < 2) await sleep(120 * (attempt + 1)); // 120ms, 240ms
         }
       }
+      // All retries failed — drop peer so devices reconnect and reset ratchet.
+      this.centralConns.delete(deviceId);
+      this.dropPeer(deviceId);
       return;
     }
 
     if (this.peripheralConns.has(deviceId)) {
       const { BlePeripheral } = NativeModules;
-      try {
-        await BlePeripheral?.send(deviceId, frame);
-      } catch {
-        // Peripheral notify can fail transiently (ATT busy) when both sides
-        // write simultaneously. Swallow the error; BlePeripheralCentralDisconnected
-        // handles true disconnects without nuking session state.
+      // Retry notify up to 3 times (can transiently fail when ATT is busy).
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await BlePeripheral?.send(deviceId, frame);
+          return;
+        } catch {
+          if (attempt < 2) await sleep(80 * (attempt + 1)); // 80ms, 160ms
+        }
       }
+      // All retries failed — drop peer so the ratchet resets on reconnect.
+      this.peripheralConns.delete(deviceId);
+      this.dropPeer(deviceId);
     }
   }
 
