@@ -13,6 +13,7 @@ import type { StackNavigationProp } from '@react-navigation/stack';
 import { useApp } from '../store/AppStore';
 import { MessageBubble } from '../components/MessageBubble';
 import { MessageInput } from '../components/MessageInput';
+import { DonateButton } from '../components/DonateButton';
 import { MediaKind } from '../types';
 import type { RootStackParamList } from '../App';
 
@@ -53,6 +54,8 @@ export function GeneralChatScreen() {
         </View>
 
         <View style={styles.headerRight}>
+          <DonateButton />
+
           <TouchableOpacity
             style={styles.peersBtn}
             onPress={() => navigation.navigate('PeerList')}>

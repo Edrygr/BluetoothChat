@@ -6,15 +6,14 @@ import {
   TouchableOpacity,
   StyleSheet,
   SafeAreaView,
-  Alert,
   Modal,
-  Clipboard,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import type { StackNavigationProp } from '@react-navigation/stack';
 import { useApp } from '../store/AppStore';
 import { Peer } from '../types';
 import type { RootStackParamList } from '../App';
+import { DonateButton } from '../components/DonateButton';
 
 type Nav = StackNavigationProp<RootStackParamList, 'PeerList'>;
 
@@ -38,6 +37,7 @@ export function PeerListScreen() {
           <Text style={styles.backText}>← Back</Text>
         </TouchableOpacity>
         <Text style={styles.title}>Peers in Mesh</Text>
+        <DonateButton />
       </View>
 
       <View style={styles.hint}>

@@ -273,8 +273,10 @@ class BluetoothService {
 
       connected.monitorCharacteristicForService(SERVICE_UUID, RX_UUID, (err, char) => {
         if (err || !char?.value) return;
-        const raw = base64ToUtf8(char.value);
-        this.handleRawFrame(raw, device.id);
+        try {
+          const raw = base64ToUtf8(char.value);
+          this.handleRawFrame(raw, device.id);
+        } catch { /* drop single corrupted frame, keep session alive */ }
       });
 
       connected.onDisconnected(() => {
@@ -329,36 +331,39 @@ class BluetoothService {
     const centralDev = this.centralConns.get(deviceId);
     if (centralDev) {
       const b64 = utf8ToBase64(frame);
-      // Retry up to 3 times — Android GATT_ERROR 133 is common and transient.
-      // We MUST retry (not just swallow) because the send-ratchet has already
-      // advanced; if delivery is silently skipped the receiver's ratchet falls
-      // out of sync and every subsequent message becomes undeliverable.
-      for (let attempt = 0; attempt < 3; attempt++) {
+      // Exponential backoff: 200 → 400 → 800 → 1600 → 3200 ms (~6 s window).
+      // Slow devices (or congested ATT) fire GATT_ERROR 133 transiently; a short
+      // window caused premature dropPeer → reconnect on every burst of messages.
+      for (let attempt = 0; attempt < 5; attempt++) {
         try {
           await centralDev.writeCharacteristicWithResponseForService(SERVICE_UUID, TX_UUID, b64);
-          return; // success
+          return;
         } catch {
-          if (attempt < 2) await sleep(120 * (attempt + 1)); // 120ms, 240ms
+          if (attempt < 4) await sleep(200 * (1 << attempt));
         }
       }
-      // All retries failed — drop peer so devices reconnect and reset ratchet.
       this.centralConns.delete(deviceId);
       this.dropPeersByLink(deviceId);
+      // Explicitly close the BLE link so the remote device receives a disconnect
+      // event and clears its own peer/ratchet state.  Without this the remote
+      // still considers us connected (old ratchet seqNums intact), so when we
+      // reconnect and exchange a fresh HANDSHAKE the seqNum mismatch silently
+      // drops every message.
+      try { await centralDev.cancelConnection(); } catch {}
       return;
     }
 
     if (this.peripheralConns.has(deviceId)) {
       const { BlePeripheral } = NativeModules;
-      // Retry notify up to 3 times (can transiently fail when ATT is busy).
-      for (let attempt = 0; attempt < 3; attempt++) {
+      // Same backoff on the peripheral notify path: 150 → 300 → 600 → 1200 ms.
+      for (let attempt = 0; attempt < 4; attempt++) {
         try {
           await BlePeripheral?.send(deviceId, frame);
           return;
         } catch {
-          if (attempt < 2) await sleep(80 * (attempt + 1)); // 80ms, 160ms
+          if (attempt < 3) await sleep(150 * (1 << attempt));
         }
       }
-      // All retries failed — drop peer so the ratchet resets on reconnect.
       this.peripheralConns.delete(deviceId);
       this.dropPeersByLink(deviceId);
     }
@@ -414,8 +419,14 @@ class BluetoothService {
     const sharedSecret = deriveSharedSecret(this.keyPair.privateKey, theirPub);
     const sas          = deriveSAS(sharedSecret);
 
-    this.sendRatchets.set(peerKey, initRatchet(sharedSecret));
-    this.recvRatchets.set(peerKey, initRatchet(sharedSecret));
+    // Only initialise ratchets for brand-new peers.  Re-initialising on a
+    // duplicate HANDSHAKE (e.g. proactive retry + peripheral reply both land)
+    // would reset seqNums while the remote side has already advanced, causing
+    // every subsequent message to fail the seqNum check.
+    if (isNewPeer) {
+      this.sendRatchets.set(peerKey, initRatchet(sharedSecret));
+      this.recvRatchets.set(peerKey, initRatchet(sharedSecret));
+    }
     this.anonToPeerKey.set(pkt.anonymousId, peerKey);
 
     this.peers.set(peerKey, {
@@ -591,6 +602,8 @@ class BluetoothService {
 
   private handleDM(pkt: BTPacket, fromDeviceId: string): void {
     if (!pkt.data || !pkt.nonce || pkt.seqNum === undefined) return;
+    if (this.seenIds.has(pkt.id)) return;
+    this.seenIds.set(pkt.id, Date.now());
 
     const isForMe = pkt.to === this.anonymousId;
     const isRelay = !isForMe && !!pkt.to;
@@ -757,12 +770,9 @@ class BluetoothService {
     const directKeys = Array.from(this.peers.keys()).filter(k => !k.startsWith(VIRT));
     if (directKeys.length === 0) return;
     const peerKey = directKeys[Math.floor(Math.random() * directKeys.length)];
-    const enc     = this.ratchetEncryptFor(peerKey, '\x00');
-    if (!enc) return;
-    this.writeToDevice(peerKey, {
-      type: 'COVER', id: generateMessageId(), from: '',
-      data: enc.data, nonce: enc.nonce, seqNum: enc.seqNum,
-    });
+    // Do NOT encrypt with the ratchet: the receiver ignores COVER packets without
+    // advancing its recv-ratchet, which would permanently desync the seqNums.
+    this.writeToDevice(peerKey, { type: 'COVER', id: generateMessageId(), from: '' });
   }
 
   // ─── Peer management ─────────────────────────────────────────────────────
@@ -783,14 +793,15 @@ class BluetoothService {
     this.notifyPeers();
   }
 
-  // Drop all peers (direct and virtual) that route through a given BLE link.
+  // Drop all peers (direct and virtual) that route through a given BLE link,
+  // then immediately start a new scan cycle so we reconnect as fast as possible
+  // instead of waiting for the next scheduled 12-second interval.
   private dropPeersByLink(deviceId: string): void {
-    // Direct peer
     this.dropPeer(deviceId);
-    // Virtual peers routed via this link
     for (const [peerKey, link] of this.virtualRoutes) {
       if (link === deviceId) this.dropPeer(peerKey);
     }
+    this.runScan();
   }
 
   private getPeerByAnonymousId(anonymousId: string): [string, Peer] | null {
